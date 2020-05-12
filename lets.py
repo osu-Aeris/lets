@@ -1,11 +1,4 @@
 # General imports
-import argparse
-import logging
-import signal
-
-from helpers.config import Config
-logging.basicConfig(level=logging.DEBUG if Config()["DEBUG"] else logging.INFO)
-
 import os
 import sys
 from multiprocessing.pool import ThreadPool
@@ -14,10 +7,16 @@ import tornado.gen
 import tornado.httpserver
 import tornado.ioloop
 import tornado.web
-import tornado.netutil
 from raven.contrib.tornado import AsyncSentryClient
 import redis
 
+import json
+import shutil
+from distutils.version import LooseVersion
+
+from constants import rankedStatuses
+
+from common.constants import bcolors, mods
 from common.db import dbConnector
 from common.ddog import datadogClient
 from common.log import logUtils as log
@@ -32,19 +31,35 @@ from handlers import defaultHandler
 from handlers import downloadMapHandler
 from handlers import emptyHandler
 from handlers import getFullReplayHandler
+from handlers import getFullReplayHandlerRelax
 from handlers import getReplayHandler
 from handlers import getScoresHandler
 from handlers import getScreenshotHandler
+from handlers import getSeasonalHandler
 from handlers import loadTestHandler
 from handlers import mapsHandler
+from handlers import inGameRegistrationHandler
+from handlers import getFullErrorHandler
 from handlers import osuErrorHandler
 from handlers import osuSearchHandler
 from handlers import osuSearchSetHandler
+from handlers import osuSessionHandler
 from handlers import redirectHandler
 from handlers import submitModularHandler
 from handlers import uploadScreenshotHandler
 from handlers import commentHandler
+from handlers import lastFMHandler
+from handlers import updateHandler
+from handlers import apiRestartHandler
+from handlers import empty
+from handlers.lazer import lazerConnectHandler
+from handlers.lazer import lazerAPIHandler
+from handlers.storage import storageLoginHandler
+from handlers.storage import storageFilePost
+from handlers.storage import storageFileGet
+from helpers import config
 from helpers import consoleHelper
+from common import generalUtils
 from common import agpl
 from objects import glob
 from pubSubHandlers import beatmapUpdateHandler
@@ -53,113 +68,164 @@ import secret.achievements.utils
 
 def make_app():
 	return tornado.web.Application([
+		(r"/users", inGameRegistrationHandler.handler),
 		(r"/web/bancho_connect.php", banchoConnectHandler.handler),
 		(r"/web/osu-osz2-getscores.php", getScoresHandler.handler),
 		(r"/web/osu-submit-modular.php", submitModularHandler.handler),
 		(r"/web/osu-submit-modular-selector.php", submitModularHandler.handler),
 		(r"/web/osu-getreplay.php", getReplayHandler.handler),
+		(r"/web/osu-getseasonal.php", getSeasonalHandler.handler),
 		(r"/web/osu-screenshot.php", uploadScreenshotHandler.handler),
 		(r"/web/osu-search.php", osuSearchHandler.handler),
 		(r"/web/osu-search-set.php", osuSearchSetHandler.handler),
+		(r"/web/osu-session.php", osuSessionHandler.handler),
 		(r"/web/check-updates.php", checkUpdatesHandler.handler),
 		(r"/web/osu-error.php", osuErrorHandler.handler),
 		(r"/web/osu-comment.php", commentHandler.handler),
-		(r"/web/osu-rate.php", rateHandler.handler),
 		(r"/p/changelog", changelogHandler.handler),
+		(r"/web/changelog.php", changelogHandler.handler),
+		(r"/home/changelog", changelogHandler.handler),
+		(r"/web/osu-rate.php", rateHandler.handler),
 		(r"/ss/(.*)", getScreenshotHandler.handler),
 		(r"/web/maps/(.*)", mapsHandler.handler),
 		(r"/d/(.*)", downloadMapHandler.handler),
 		(r"/s/(.*)", downloadMapHandler.handler),
+		(r"/b/(.*)", redirectHandler.handler, dict(destination="https://aeris-dev.pw/b/{}")),
 		(r"/web/replays/(.*)", getFullReplayHandler.handler),
+		(r"/web/replays_relax/(.*)", getFullReplayHandlerRelax.handler),
+		(r"/web/errorlogs/(.*)", getFullErrorHandler.handler),
 
-		(r"/p/verify", redirectHandler.handler, dict(destination="https://ripple.moe/index.php?p=2")),
-		(r"/u/(.*)", redirectHandler.handler, dict(destination="https://ripple.moe/index.php?u={}")),
+		(r"/p/verify", redirectHandler.handler, dict(destination="https://aeris-dev.pw/")),
+		(r"/u/(.*)", redirectHandler.handler, dict(destination="https://aeris-dev.pw/u/{}")),
 
 		(r"/api/v1/status", apiStatusHandler.handler),
+		(r"/letsapi/v1/restart", apiRestartHandler.handler),
 		(r"/api/v1/pp", apiPPHandler.handler),
+		(r"/letsapi/v1/give_donor", empty.handler),
 		(r"/api/v1/cacheBeatmap", apiCacheBeatmapHandler.handler),
+		(r"/v1/release/(.*)", redirectHandler.handler, dict(destination="https://aeris-dev.pw/static/updater/{}")),
 
 		(r"/letsapi/v1/status", apiStatusHandler.handler),
 		(r"/letsapi/v1/pp", apiPPHandler.handler),
 		(r"/letsapi/v1/cacheBeatmap", apiCacheBeatmapHandler.handler),
+		(r"/web/lastfm.php", lastFMHandler.handler),
+		(r"/v1/update(.*)", updateHandler.handler),
+		(r"/letsapi/v2/(.*)", lazerAPIHandler.handler),
+		(r"/oauth/token", lazerConnectHandler.handler),
 
+		(r"/storage/login", storageLoginHandler.handler),
+		(r"/storage/post", storageFilePost.handler),
+		(r"/storage/get/(.*)", storageFileGet.handler),
+		
 		# Not done yet
-		(r"/web/lastfm.php", emptyHandler.handler),
-		(r"/web/osu-checktweets.php", emptyHandler.handler),
-		(r"/web/osu-addfavourite.php", emptyHandler.handler),
+		(r"/web/osu-get-beatmap-topic.php", emptyHandler.handler), # Beatmap Topic
+		(r"/web/osu-markasread.php", emptyHandler.handler), # Mark As Read
+		(r"/web/osu-addfavourite.php", emptyHandler.handler), # Add Favorite
+		(r"/web/osu-checktweets.php", emptyHandler.handler), # Do we need this?
 
 		(r"/loadTest", loadTestHandler.handler),
 	], default_handler_class=defaultHandler.handler)
 
 
 if __name__ == "__main__":
-	parser = argparse.ArgumentParser(
-		description=consoleHelper.ASCII + "\n\nLatest Essential Tatoe Server v{}\nBy The Ripple Team".format(
-			glob.VERSION
-		),
-		formatter_class=argparse.RawTextHelpFormatter
-	)
-	parser.add_argument("-p", "--port", help="Run on a specific port (bypasses config.ini)", required=False)
-	cli_args = parser.parse_args()
-
 	# AGPL license agreement
 	try:
 		agpl.check_license("ripple", "LETS")
 	except agpl.LicenseError as e:
-		logging.error(str(e))
+		print(str(e))
 		sys.exit(1)
 
 	try:
 		consoleHelper.printServerStartHeader(True)
 
 		# Read config
-		logging.info("Reading config file... ")
-		glob.conf = Config()
+		consoleHelper.printNoNl("> Reading config file... ")
+		glob.conf = config.config("config.ini")
+
+		if glob.conf.default:
+			# We have generated a default config.ini, quit server
+			consoleHelper.printWarning()
+			consoleHelper.printColored("[!] config.ini not found. A default one has been generated.", bcolors.YELLOW)
+			consoleHelper.printColored("[!] Please edit your config.ini and run the server again.", bcolors.YELLOW)
+			sys.exit()
+
+		# If we haven't generated a default config.ini, check if it's valid
+		if not glob.conf.checkConfig():
+			consoleHelper.printError()
+			consoleHelper.printColored("[!] Invalid config.ini. Please configure it properly", bcolors.RED)
+			consoleHelper.printColored("[!] Delete your config.ini to generate a default one", bcolors.RED)
+			sys.exit()
+		else:
+			consoleHelper.printDone()
+
+		# Read additional config file
+		consoleHelper.printNoNl("> Loading additional config file... ")
+		try:
+			if not os.path.isfile(glob.conf.config["custom"]["config"]):
+				consoleHelper.printWarning()
+				consoleHelper.printColored("[!] Missing config file at {}; A default one has been generated at this location.".format(glob.conf.config["custom"]["config"]), bcolors.YELLOW)
+				shutil.copy("common/default_config.json", glob.conf.config["custom"]["config"])
+
+			with open(glob.conf.config["custom"]["config"], "r") as f:
+				glob.conf.extra = json.load(f)
+
+			consoleHelper.printDone()
+		except:
+			consoleHelper.printWarning()
+			consoleHelper.printColored("[!] Unable to load custom config at {}".format(glob.conf.config["custom"]["config"]), bcolors.RED)
+			consoleHelper.printColored("[!] Make sure you have the latest osu!thailand common submodule!", bcolors.RED)
+			sys.exit()
+
+		# Check if running common module is usable
+		if glob.COMMON_VERSION == "Unknown":
+			consoleHelper.printWarning()
+			consoleHelper.printColored("[!] You do not seem to be using osu!thailand's common submodule... nothing will work...", bcolors.RED)
+			consoleHelper.printColored("[!] You can download or fork the submodule from {}https://github.com/osuthailand/common".format(bcolors.UNDERLINE), bcolors.RED)
+			sys.exit()
+		elif LooseVersion(glob.COMMON_VERSION_REQ) > LooseVersion(glob.COMMON_VERSION):
+			consoleHelper.printColored("[!] Your common submodule version is below the required version number for this version of lets.", bcolors.RED)
+			consoleHelper.printColored("[!] You are highly adviced to update your common submodule as stability may vary with outdated modules.", bcolors.RED)
 
 		# Create data/oppai maps folder if needed
-		logging.info("Checking folders... ")
-		paths = (
+		consoleHelper.printNoNl("> Checking folders... ")
+		paths = [
 			".data",
-			glob.conf["BEATMAPS_FOLDER"],
-			glob.conf["SCREENSHOTS_FOLDER"],
-			glob.conf["FAILED_REPLAYS_FOLDER"],
-			glob.conf["REPLAYS_FOLDER"]
-		)
+			".data/oppai",
+			".data/catch_the_pp",
+			glob.conf.config["server"]["replayspath"],
+			"{}_relax".format(glob.conf.config["server"]["replayspath"]),
+			glob.conf.config["server"]["beatmapspath"],
+			glob.conf.config["server"]["screenshotspath"]
+		]
 		for i in paths:
 			if not os.path.exists(i):
 				os.makedirs(i, 0o770)
+		consoleHelper.printDone()
 
 		# Connect to db
 		try:
-			logging.info("Connecting to MySQL database")
-			glob.db = dbConnector.db(
-				host=glob.conf["DB_HOST"],
-				port=glob.conf["DB_PORT"],
-				user=glob.conf["DB_USERNAME"],
-				password=glob.conf["DB_PASSWORD"],
-				database=glob.conf["DB_NAME"],
-				autocommit=True,
-				charset="utf8"
-			)
-			glob.db.fetch("SELECT 1")
+			consoleHelper.printNoNl("> Connecting to MySQL database... ")
+			glob.db = dbConnector.db(glob.conf.config["db"]["host"], glob.conf.config["db"]["username"], glob.conf.config["db"]["password"], glob.conf.config["db"]["database"], int(
+				glob.conf.config["db"]["workers"]))
+			consoleHelper.printNoNl(" ")
+			consoleHelper.printDone()
 		except:
 			# Exception while connecting to db
-			logging.error("Error while connection to database. Please check your config.ini and run the server again")
+			consoleHelper.printError()
+			consoleHelper.printColored("[!] Error while connection to database. Please check your config.ini and run the server again", bcolors.RED)
 			raise
 
 		# Connect to redis
 		try:
-			logging.info("Connecting to redis")
-			glob.redis = redis.Redis(
-				glob.conf["REDIS_HOST"],
-				glob.conf["REDIS_PORT"],
-				glob.conf["REDIS_DATABASE"],
-				glob.conf["REDIS_PASSWORD"]
-			)
+			consoleHelper.printNoNl("> Connecting to redis... ")
+			glob.redis = redis.Redis(glob.conf.config["redis"]["host"], glob.conf.config["redis"]["port"], glob.conf.config["redis"]["database"], glob.conf.config["redis"]["password"])
 			glob.redis.ping()
+			consoleHelper.printNoNl(" ")
+			consoleHelper.printDone()
 		except:
 			# Exception while connecting to db
-			logging.error("Error while connection to redis. Please check your config.ini and run the server again")
+			consoleHelper.printError()
+			consoleHelper.printColored("[!] Error while connection to redis. Please check your config.ini and run the server again", bcolors.RED)
 			raise
 
 		# Empty redis cache
@@ -174,130 +240,95 @@ if __name__ == "__main__":
 
 		# Create threads pool
 		try:
-			logging.info("Creating threads pool")
-			glob.pool = ThreadPool(glob.conf["THREADS"])
+			consoleHelper.printNoNl("> Creating threads pool... ")
+			glob.pool = ThreadPool(int(glob.conf.config["server"]["threads"]))
+			consoleHelper.printDone()
 		except:
-			logging.error("Error while creating threads pool. Please check your config.ini and run the server again")
-			raise
+			consoleHelper.printError()
+			consoleHelper.printColored("[!] Error while creating threads pool. Please check your config.ini and run the server again", bcolors.RED)
 
 		# Check osuapi
-		if not glob.conf["OSU_API_ENABLE"]:
-			logging.warning(
-				"osu!api features are disabled. If you don't have a "
-				"valid beatmaps table, all beatmaps will show as unranked"
-			)
-			if glob.conf["BEATMAP_CACHE_EXPIRE"] > 0:
-				logging.warning(
-					"IMPORTANT! Your beatmapcacheexpire in config.ini is > 0 and osu!api "
-					"features are disabled.\nWe do not reccoment this, because too old "
-					"beatmaps will be shown as unranked.\nSet beatmapcacheexpire to 0 to "
-					"disable beatmap latest update check and fix that issue."
-				)
+		if not generalUtils.stringToBool(glob.conf.config["osuapi"]["enable"]):
+			consoleHelper.printColored("[!] osu!api features are disabled. If you don't have a valid beatmaps table, all beatmaps will show as unranked", bcolors.YELLOW)
+			if int(glob.conf.config["server"]["beatmapcacheexpire"]) > 0:
+				consoleHelper.printColored("[!] IMPORTANT! Your beatmapcacheexpire in config.ini is > 0 and osu!api features are disabled.\nWe do not reccoment this, because too old beatmaps will be shown as unranked.\nSet beatmapcacheexpire to 0 to disable beatmap latest update check and fix that issue.", bcolors.YELLOW)
 
 		# Load achievements
-		logging.info("Loading achievements")
+		consoleHelper.printNoNl("Loading achievements... ")
 		try:
 			secret.achievements.utils.load_achievements()
-		except:
-			logging.error("Error while loading achievements")
-			raise
+		except Exception as e:
+			consoleHelper.printError()
+			consoleHelper.printColored(
+				"[!] Error while loading achievements! ({})".format(e),
+				bcolors.RED,
+			)
+			sys.exit()
+		consoleHelper.printDone()
 
 		# Set achievements version
 		glob.redis.set("lets:achievements_version", glob.ACHIEVEMENTS_VERSION)
-		logging.info("Achievements version is {}".format(glob.ACHIEVEMENTS_VERSION))
+		consoleHelper.printColored("Achievements version is {}".format(glob.ACHIEVEMENTS_VERSION), bcolors.YELLOW)
 
-		# Load AQL thresholds
-		logging.info("Loading AQL thresholds")
-		try:
-			glob.aqlThresholds.reload()
-		except:
-			logging.error("Error while reloading AQL thresholds")
-			raise
+		# Print disallowed mods into console (Used to also assign it into variable but has been moved elsewhere)
+		unranked_mods = [key for key, value in glob.conf.extra["common"]["rankable-mods"].items() if not value]
+		consoleHelper.printColored("Unranked mods: {}".format(", ".join(unranked_mods)), bcolors.YELLOW)
+		
+		# Print allowed beatmap rank statuses
+		allowed_beatmap_rank = [key for key, value in glob.conf.extra["lets"]["allowed-beatmap-rankstatus"].items() if value]
+		consoleHelper.printColored("Allowed beatmap rank statuses: {}".format(", ".join(allowed_beatmap_rank)), bcolors.YELLOW)
 
-		# Check if s3 is enabled
-		if not glob.conf.s3_enabled:
-			logging.warning("S3 is disabled")
-		else:
-			c = glob.db.fetch("SELECT COUNT(*) AS c FROM s3_replay_buckets WHERE max_score_id IS NULL")["c"]
-			if c != 1:
-				logging.error(
-					"There must be only one bucket flagged as WRITE bucket! You have {}.".format(c),
-				)
-				sys.exit()
+		# Make array of bools to respective rank id's
+		glob.conf.extra["_allowed_beatmap_rank"] = [getattr(rankedStatuses, key) for key in allowed_beatmap_rank] # Store the allowed beatmap rank id's into glob
 
-		# Discord
-		if glob.conf.schiavo_enabled:
-			glob.schiavo = schiavo.schiavo(glob.conf["SCHIAVO_URL"], "**lets**")
-		else:
-			logging.warning("Schiavo logging is disabled!")
+		# Check debug mods
+		glob.debug = generalUtils.stringToBool(glob.conf.config["server"]["debug"])
+		if glob.debug:
+			consoleHelper.printColored("[!] Warning! Server running in debug mode!", bcolors.YELLOW)
 
 		# Server port
 		try:
-			if cli_args.port:
-				logging.warning("Running on port {}, bypassing config.ini".format(cli_args.port))
-				glob.serverPort = int(cli_args.port)
-			else:
-				glob.serverPort = glob.conf["HTTP_PORT"]
+			serverPort = int(glob.conf.config["server"]["port"])
 		except:
-			logging.error("Invalid server port! Please check your config.ini and run the server again")
-			raise
+			consoleHelper.printColored("[!] Invalid server port! Please check your config.ini and run the server again", bcolors.RED)
 
 		# Make app
 		glob.application = make_app()
 
 		# Set up sentry
-		if glob.conf.sentry_enabled:
-			glob.application.sentry_client = AsyncSentryClient(glob.conf["SENTRY_DSN"], release=glob.VERSION)
-		else:
-			logging.warning("Sentry logging is disabled!")
+		try:
+			glob.sentry = generalUtils.stringToBool(glob.conf.config["sentry"]["enable"])
+			if glob.sentry:
+				glob.application.sentry_client = AsyncSentryClient(glob.conf.config["sentry"]["dsn"], release=glob.VERSION)
+			else:
+				consoleHelper.printColored("[!] Warning! Sentry logging is disabled!", bcolors.YELLOW)
+		except Exception as e:
+			consoleHelper.printColored("[!] Error while starting Sentry client! Please check your config.ini and run the server again", bcolors.RED)
+			print(e)
 
 		# Set up Datadog
-		if glob.conf.datadog_enabled:
-			glob.dog = datadogClient.datadogClient(
-				glob.conf["DATADOG_API_KEY"],
-				glob.conf["DATADOG_APP_KEY"],
-				constant_tags=["worker:{}".format(glob.serverPort)]
-			)
-		else:
-			glob.dog = datadogClient.datadogClient()
-			logging.warning("Datadog stats tracking is disabled!")
+		try:
+			if generalUtils.stringToBool(glob.conf.config["datadog"]["enable"]):
+				glob.dog = datadogClient.datadogClient(glob.conf.config["datadog"]["apikey"], glob.conf.config["datadog"]["appkey"])
+			else:
+				consoleHelper.printColored("[!] Warning! Datadog stats tracking is disabled!", bcolors.YELLOW)
+		except:
+			consoleHelper.printColored("[!] Error while starting Datadog client! Please check your config.ini and run the server again", bcolors.RED)
 
 		# Connect to pubsub channels
 		pubSub.listener(glob.redis, {
 			"lets:beatmap_updates": beatmapUpdateHandler.handler(),
-			"lets:reload_aql": lambda x: x == b"reload" and glob.aqlThresholds.reload(),
 		}).start()
 
-		# Check debug mods
-		if glob.conf["DEBUG"]:
-			logging.warning("Server running in debug mode.")
-
-		# Close main thread db connection as we don't need it anymore
-		glob.threadScope.dbClose()
-
 		# Server start message and console output
-		logging.info("L.E.T.S. is listening for clients on {}:{}...".format(
-			glob.conf["HTTP_HOST"],
-			glob.serverPort
-		))
-		# log.discord("bunker", "Server started!")
+		consoleHelper.printColored("> L.E.T.S. is listening for clients on {}:{}...".format(glob.conf.config["server"]["host"], serverPort), bcolors.GREEN)
+		log.logMessage("Server started!", discord="bunker", stdout=False)
 
 		# Start Tornado
-		def term(_, __):
-			log.info("Stopping server...")
-			tornado.ioloop.IOLoop.instance().add_callback_from_signal(
-				lambda: tornado.ioloop.IOLoop.instance().stop()
-			)
-
-		signal.signal(signal.SIGINT, term)
-		signal.signal(signal.SIGTERM, term)
-		glob.application.listen(glob.serverPort, address=glob.conf["HTTP_HOST"])
+		glob.application.listen(serverPort, address=glob.conf.config["server"]["host"])
 		tornado.ioloop.IOLoop.instance().start()
 	finally:
 		# Perform some clean up
-		logging.info("Disposing server")
+		print("> Disposing server... ")
 		glob.fileBuffers.flushAll()
-		if glob.redis.connection_pool is not None:
-			glob.redis.connection_pool.disconnect()
-		# TODO: properly dispose mysql connections
-		logging.info("Goodbye!")
+		consoleHelper.printColored("Goodbye!", bcolors.GREEN)
