@@ -24,7 +24,7 @@ class handler(requestsManager.asyncRequestHandler):
 	@sentry.captureTornado
 	def asyncPost(self):
 		try:
-			if glob.conf["DEBUG"]:
+			if glob.debug:
 				requestsManager.printArguments(self)
 
 			# Make sure screenshot file was passed
@@ -49,23 +49,28 @@ class handler(requestsManager.asyncRequestHandler):
 				return
 			glob.redis.set("lets:screenshot:{}".format(userID), 1, 60)
 
+			#check if user folder exist
+			screenshotID = generalUtils.randomString(8)
+			if not os.path.isdir("{}/{}/".format(glob.conf.config["server"]["storagepath"], userID)):
+				os.mkdir("{}/{}/".format(glob.conf.config["server"]["storagepath"], userID))
+
 			# Get a random screenshot id
 			found = False
 			screenshotID = ""
 			while not found:
 				screenshotID = generalUtils.randomString(8)
-				if not os.path.isfile("{}/{}.jpg".format(glob.conf["SCREENSHOTS_FOLDER"], screenshotID)):
+				if not os.path.isfile("{}/{}/{}.jpg".format(glob.conf.config["server"]["storagepath"], userID, screenshotID)):
 					found = True
 
-			# Write screenshot file to .data folder
-			with open("{}/{}.jpg".format(glob.conf["SCREENSHOTS_FOLDER"], screenshotID), "wb") as f:
+			# Write screenshot file to screenshots folder
+			with open("{}/{}/{}.jpg".format(glob.conf.config["server"]["storagepath"], userID, screenshotID), "wb") as f:
 				f.write(self.request.files["ss"][0]["body"])
 
 			# Output
 			log.info("New screenshot ({})".format(screenshotID))
 
 			# Return screenshot link
-			self.write("{}/ss/{}.jpg".format(glob.conf["SERVER_URL"], screenshotID))
+			self.write("https://storage.aeris-dev.pw/get/{}/{}.jpg".format(userID, screenshotID))
 		except exceptions.need2FAException:
 			pass
 		except exceptions.invalidArgumentsException:
